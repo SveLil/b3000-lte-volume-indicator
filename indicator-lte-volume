@@ -1,0 +1,343 @@
+#!/usr/bin/env python3
+
+#Copyright (C) 2017 Sven Lilienthal
+#
+#This program is free software: you can redistribute it and/or modify
+#it under the terms of the GNU General Public License as published by
+#the Free Software Foundation, either version 3 of the License, or
+#(at your option) any later version.
+
+#This program is distributed in the hope that it will be useful,
+#but WITHOUT ANY WARRANTY; without even the implied warranty of
+#MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#GNU General Public License for more details.
+
+#You should have received a copy of the GNU General Public License
+#along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+import sys
+import logging
+import os.path
+from urllib.request import urlopen
+from urllib.request import Request
+from urllib.error import URLError
+import json
+import signal
+import datetime
+import threading
+import xml.etree.ElementTree as ET
+
+from gi.repository import GObject
+from gi.repository import Gtk
+from gi.repository import AppIndicator3
+from gi.repository import GLib
+
+import matplotlib
+matplotlib.use('GTK3Cairo')
+from matplotlib.figure import Figure
+import matplotlib.cm as cm
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_gtk3cairo import FigureCanvasGTK3Cairo as FigureCanvas
+
+# Constants
+ID      = 'indicator-lte-volume'
+NAME    = 'LTE Volume Indicator'
+ICON    = "www.svg"
+ICON_SMS = "yellow.svg"
+ICON_ATTENTION = "red.svg"
+VERSION = '1.0.0'
+LICENCE = """This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>."""
+
+LABEL_GUIDE = "999.99G↑ 999.99G↓ 999.99G⇅"
+HOUR_TIMEDELTA = datetime.timedelta(hours=1)
+
+#class DateTimeDecoder(json.JSONDecoder):
+def datetime_encoder(dct):
+    r = dict()
+    for k, v in dct.items():
+        r[k.replace(microsecond=0).isoformat()]=v
+    return r
+
+def datetime_parser(dct):
+    r = dict()
+    for k, v in dct.items():
+        r[datetime.datetime.strptime(k, "%Y-%m-%dT%H:%M:%S")] = v
+    return r
+
+def _parse_cmd_line():
+    """Parse command line arguments. Currently only sets up logging."""
+    # Check command line arguments
+    lvl = logging.WARNING
+    for arg in sys.argv:
+        if arg == '-v':
+            lvl = logging.INFO
+            break
+        elif arg == '-vv':
+            lvl = logging.DEBUG
+            break
+    # Set up logging options
+    logging.basicConfig(level=lvl, format='%(levelname).3s %(message)s')
+
+class LteVolumeIndicator(GObject.GObject):
+
+    def __init__(self):
+        """Constructor."""
+        GObject.GObject.__init__(self)
+
+        # Create the indicator object
+        self.indicator = AppIndicator3.Indicator.new(ID, os.path.abspath(ICON), AppIndicator3.IndicatorCategory.HARDWARE)
+        self.indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
+        self.indicator.set_property('label-guide', LABEL_GUIDE)
+        self.indicator.set_label("Loading...", LABEL_GUIDE);
+
+        self.up = -1
+        self.down = -1
+        self.up_and_down = -1
+        self.error_count = 0
+        #Init last update to an hour ago, the first update will be logged
+        self.last_update = datetime.datetime.now() - HOUR_TIMEDELTA
+
+        config_filename = os.path.join(GLib.get_user_config_dir(), ID + '.ini')
+        try:
+            with open(config_filename) as config_file:
+                self.config = json.load(config_file)
+                logging.debug("Loaded config file" + str(self.config))
+        except FileNotFoundError:
+            self.config = {}
+            self.config['url'] = "http://vodafonemobile.cpe"
+            self.config['display'] = 'all'
+
+        data_filename = os.path.join(GLib.get_user_config_dir(), ID + '.data')
+        try:
+            with open(data_filename) as data_file:
+                self.data_history = datetime_parser(json.load(data_file))
+        except FileNotFoundError:
+            self.data_history = dict()
+
+        # Create a menu
+        self.menu = Gtk.Menu()
+        self.indicator.set_menu(self.menu)
+        self.setup_menu()
+
+    def main(self):
+        """The main app function."""
+        self.update()
+        #GLib.timeout_add_seconds(30, self.update)
+        self.bg_thread = threading.Timer(30, self.update)
+        self.bg_thread.start()
+        #GLib.timeout_add_seconds(5, self.update_label)
+        Gtk.main()
+
+    def shutdown(self):
+        """Shuts down the app."""
+        self.bg_thread.cancel()
+        config_filename = os.path.join(GLib.get_user_config_dir(), ID + '.ini')
+        with open(config_filename, 'w') as f:
+            json.dump(self.config,f)
+        data_filename = os.path.join(GLib.get_user_config_dir(), ID + '.data')
+        with open(data_filename, 'w') as f:
+            json.dump(datetime_encoder(self.data_history),f)
+        Gtk.main_quit()
+
+    def update_label(self):
+        up = self.up
+        down = self.down
+        up_and_down = self.up_and_down
+        logging.debug("Display: " + self.config['display'])
+        if self.config['display'] == 'all':
+            label = "↑" + str(up) +"G ↓" + str(down)+ "G ⇅" + str(up_and_down) + "G"
+        elif self.config['display'] == 'sum':
+            label = "⇅" + str(up_and_down) + "G"
+        elif self.config['display'] == 'updown':
+            label = "↑" + str(up) +"G ↓" + str(down)+ "G"
+        logging.debug(label)
+        self.indicator.set_label(label, LABEL_GUIDE)
+        return True
+
+    def update(self):
+        logging.debug("Start update")
+        try:
+            f = urlopen(self.config['url']+"/html/status/waninforefresh.asp")
+        except URLError as e:
+            logging.debug(e)
+            if (self.error_count > 2):
+                self.indicator.set_attention_icon_full(os.path.abspath(ICON_ATTENTION), "URL ERROR");
+                self.indicator.set_status(AppIndicator3.IndicatorStatus.ATTENTION)
+            self.error_count += 1
+            return True
+        self.error_count = 0
+        self.indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
+        response = f.read().decode('ascii')
+        logging.debug(response)
+        response = response.replace("WanStatistics = ","{ 'WanStatistics': ").replace("};", "},", 1).replace("wanIPDNS = ", "'wanIPDNS': ").replace("};", "}\n}").replace("'","\"")
+        response_object = json.loads(response)
+        up = int(response_object["WanStatistics"]["upvolume"])
+        down = int(response_object["WanStatistics"]["downvolume"])
+        up_and_down = up + down
+        self.up = int(up / 1024 / 1024 / 10.24)/100
+        self.down = int(down / 1024 / 1024 / 10.24)/100
+        self.up_and_down = int(up_and_down / 1024 / 1024 / 10.24)/100
+        if (self.up >= 0 and self.down >=0):
+            self.update_label()
+            now = datetime.datetime.now()
+            if (now - self.last_update) >= HOUR_TIMEDELTA:
+                #More than one hour has pased since the last log
+                self.data_history[now] = [up, down]
+        try:
+            r = Request(self.config['url']+"/index/getStatusByAjax.cgi", method="POST")
+            f = urlopen(r)
+        except URLError as e:
+            logging.debug(e)
+            if (self.error_count > 2):
+                self.indicator.set_attention_icon_full(os.path.abspath(ICON_ATTENTION), "URL ERROR");
+                self.indicator.set_status(AppIndicator3.IndicatorStatus.ATTENTION)
+            self.error_count += 1
+            return True
+        root = ET.fromstring(f.read().decode('ascii'))
+        sms = root.find("SMS").text.split(',')[1]
+        logging.debug("SMS: " + sms)
+        if int(sms) <= 0:
+            self.indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
+        else:
+            self.indicator.set_attention_icon_full(os.path.abspath(ICON_SMS), "SMS");
+            self.indicator.set_status(AppIndicator3.IndicatorStatus.ATTENTION)
+        logging.debug("Return from update")
+        return True
+
+    ####################################################################################
+    # Menu Handlers
+    ####################################################################################
+
+    def handle_about(self, widget, buf):
+        """Handler of about item click event."""
+        dialog = Gtk.AboutDialog()
+        dialog.set_program_name(NAME)
+        dialog.set_copyright('Copyright (C) 2017 Sven Lilienthal')
+        dialog.set_license(LICENCE)
+        dialog.set_version(VERSION)
+        dialog.set_logo_icon_name(os.path.abspath(ICON))
+        dialog.connect('response', lambda x, y: dialog.destroy())
+        dialog.run()
+
+    def handle_quit(self, widget, buf):
+        """Terminates the app."""
+        self.shutdown()
+
+    def handle_refresh(self, widget, buf):
+        """Handler of refresh item click event."""
+        self.update()
+
+    def handle_chart(self, widget, buf):
+        """Handler of show chart event"""
+        logging.debug("Show chart called")
+        dialog = Gtk.Dialog("Volume timeline", None,
+            Gtk.DialogFlags.MODAL | Gtk.DialogFlags.DESTROY_WITH_PARENT,
+            (Gtk.STOCK_OK, Gtk.ResponseType.OK))
+        dialog.set_default_size(600, 400)
+        fig = Figure(figsize=(5,5), dpi=75)
+        ax = fig.add_subplot(111)
+        #v = 5
+        #d = dict()
+        #for n in range(1,10):
+        #    tt = datetime.datetime.now()-datetime.timedelta(hours=-n)
+        #    v += 2.5
+        #    d[tt]=[v, v*1.25]
+        #x,y = zip(*list(d.items()))
+        logging.debug("map items")
+        x,y = zip(*list(self.data_history.items()))
+        up,down = map(list,zip(*y))
+        up_and_down = list(map(lambda x: x[0]+x[1], y))
+        ax.plot(x,up, label="Up")
+        ax.plot(x,down, label="Down")
+        ax.plot(x,up_and_down, label="Sum")
+        ax.set_ylabel("Volumen in gb")
+        fig.autofmt_xdate()
+        #ax.fmt_xdata =
+        ax.xaxis.set_major_locator(matplotlib.dates.WeekdayLocator())
+        ax.xaxis.set_major_formatter(matplotlib.dates.DateFormatter('%x'))
+        ax.xaxis.set_minor_locator(matplotlib.dates.HourLocator())
+        ax.xaxis.set_minor_formatter(matplotlib.dates.DateFormatter('%X'))
+        legend = ax.legend(loc='best', fontsize='x-large')
+        canvas = FigureCanvas(fig)
+        dialog.vbox.pack_start(canvas, True, True, 0)
+        dialog.show_all()
+        logging.debug("Display dialog")
+        dialog.run()
+        dialog.destroy()
+
+    def handle_show_up_down(self, widget, buf):
+        """Display up and down volumes"""
+        self.config['display'] = 'updown'
+        logging.debug("Set display to updown")
+        self.update_label()
+
+    def handle_show_sum(self, widget, buf):
+        """Display up and down volumes"""
+        self.config['display'] = 'sum'
+        logging.debug("Set display to sum")
+        self.update_label()
+
+    def handle_show_all(self, widget, buf):
+        """Display up and down volumes"""
+        self.config['display'] = 'all'
+        logging.debug("Set display to all")
+        self.update_label()
+
+    def append_label_menu_item(self, label: str, activate_signal):
+        """Adds an item to the indicator menu. Returns the created item."""
+        item = Gtk.MenuItem.new_with_mnemonic(label)
+        item.connect("activate", activate_signal, None)
+        self.append_menu_item(item)
+        return item
+
+    def append_radio_menu_item(self, label: str, activate_signal, active, group=[], ):
+        """Adds an item to the indicator menu. Returns the created item."""
+        if group is None:
+            item = Gtk.RadioMenuItem.new_with_mnemonic(label)
+        else:
+            item = Gtk.RadioMenuItem.new_with_mnemonic(group=group, label=label)
+        item.set_active(active)
+        item.connect("activate", activate_signal, None)
+        self.append_menu_item(item)
+        return item
+
+    def append_menu_item(self, item):
+        """Adds a item to the menu and show it"""
+        item.show()
+        self.menu.append(item)
+
+    def setup_menu(self):
+        """Initializes indicator menu."""
+        # Add static items
+        self.append_label_menu_item('_Refresh', self.handle_refresh)
+        self.append_label_menu_item('_Chart', self.handle_chart)
+        self.append_menu_item(Gtk.SeparatorMenuItem())
+        display = self.config['display']
+        item_up_down = self.append_radio_menu_item('Show _Up and Down Values', self.handle_show_up_down, display == 'updown')
+        item_sum = self.append_radio_menu_item('Show _Summarized Value', self.handle_show_sum, display == 'sum', item_up_down.get_group())
+        item_all = self.append_radio_menu_item('Show A_ll Values', self.handle_show_all, display == 'all', item_up_down.get_group())
+        self.config['display'] = display
+        self.append_menu_item(Gtk.SeparatorMenuItem())
+        self.append_label_menu_item('_About', self.handle_about)
+        self.append_label_menu_item('_Quit', self.handle_quit)
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+    # Parse the command line
+    _parse_cmd_line()
+
+    # Instantiate and run the indicator
+    indicator = LteVolumeIndicator()
+    indicator.main()

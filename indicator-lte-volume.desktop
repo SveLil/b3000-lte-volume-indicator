@@ -1,0 +1,11 @@
+[Desktop Entry]
+Categories=Internet
+Comment=Indicator for used LTE volume
+Exec=indicator-lte-volume
+Hidden=False
+Icon=indicator-lte-volume
+Name=LTE Volume Indicator
+StartupNotify=true
+Terminal=false
+Type=Application
+X-GNOME-Autostart-enabled=true
